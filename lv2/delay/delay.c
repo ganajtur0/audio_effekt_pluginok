@@ -3,37 +3,30 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <math.h>
 
-#define DELAY_URI "https://github.com/ganajtur0/pluginok/delay"
-#define MAX_DELAY_TIME 2.0f
+#define URI "https://github.com/ganajtur0/pluginok/delay"
 
 typedef enum {
-	AUDIO_IN = 0,
+	AUDIO_IN  = 0,
 	AUDIO_OUT = 1,
-	DELAY_TIME = 2,
-	FEEDBACK = 3,
-	MIX_DRY = 4,
-	MIX_WET = 5,
+	FEEDBACK  = 2,
+	MIX_DRY   = 3,
+	MIX_WET   = 4,
 } PortIndex ;
 
 typedef 
 struct {
 	float *buffer;
-	size_t samples;
-	int wptr;
+	size_t length;
 } DelayBuffer;
 
 void
 delaybuffer_init(DelayBuffer *self,
-		 double sample_rate) {
-	size_t samples = (size_t)(MAX_DELAY_TIME * (float)sample_rate) + 1;
-	if (samples < 1)
-		samples = 1;
-	self->buffer = malloc(samples * sizeof(float));
-	self->samples = samples;
-	self->wptr = 0;
-	memset(self->buffer, 0, samples * sizeof(float));
+		 size_t sample_size) {
+	self->buffer = malloc(sample_size * sizeof(float));
+	self->length = sample_size;
+	
+	memset(self->buffer, 0, sample_size * sizeof(float));
 }
 
 void
@@ -43,13 +36,18 @@ delaybuffer_free(DelayBuffer *self) {
 
 typedef 
 struct {
-	float       *in;
-	const float *delay_time;
+	const float *in;
+	float       *out;
+	float       sample_rate;
+
 	const float *feedback;
 	const float *mix_dry;
 	const float *mix_wet;
-	float       *out;
-	float       sample_rate;
+
+	float	    delay_length;
+
+	int         delayWritePosition_;
+	int	    delayReadPosition_;	
 	DelayBuffer delaybuffer;
 } Delay;
 
@@ -64,9 +62,24 @@ instantiate (const struct LV2_Descriptor *descriptor,
 	if (!self) return NULL;
 
 	self->sample_rate = (float)sample_rate;
-	delaybuffer_init(&(self->delaybuffer), sample_rate);
+	delaybuffer_init(&(self->delaybuffer), (size_t)(2.0f * sample_rate));
+
+	self->delayReadPosition_  = 0;
+	self->delayWritePosition_ = 0;
+
+	self->delay_length = 0.417;
 
 	return (LV2_Handle)self;
+}
+
+// set internal state
+static void
+activate (LV2_Handle instance) {
+	Delay *self = (Delay *) instance;
+	self->delayReadPosition_ = (size_t) ( self->delayWritePosition_ -
+					      (self->delay_length * self->sample_rate)
+					     + self->delaybuffer.length) %
+					     self->delaybuffer.length;
 }
 
 static void
@@ -78,13 +91,10 @@ connect_port (LV2_Handle instance,
 
 	switch ((PortIndex)port) {
 	case AUDIO_IN:
-		self->in = (float *)data;
+		self->in = (const float *)data;
 		break;
 	case AUDIO_OUT:
 		self->out = (float *)data;
-		break;
-	case DELAY_TIME:
-		self->delay_time = (const float *)data;
 		break;
 	case FEEDBACK:
 		self->feedback = (const float *)data;
@@ -101,53 +111,39 @@ connect_port (LV2_Handle instance,
 }
 
 static void
-activate (LV2_Handle instance) {}
+run (LV2_Handle instance, uint32_t num_samples) {
 
-static void
-run (LV2_Handle instance,
-     uint32_t num_samples) {
-	Delay *self = (Delay*)instance;
+	Delay *self = (Delay *)instance;
 	
-	const float delay_time  = *(self->delay_time) * self->delaybuffer.samples;
 	const float feedback    = *(self->feedback);
 	const float mix_dry     = *(self->mix_dry);
 	const float mix_wet     = *(self->mix_wet);
 	const float sample_rate = self->sample_rate;
 
-	float delay_amount = delay_time * self->sample_rate;
-
-	int local_wptr;
-
-	float *output_data = self->out;
 	float *delay_data  = self->delaybuffer.buffer;
 
-	local_wptr = self->delaybuffer.wptr;
+	const int delaybuffer_length = self->delaybuffer.length;
+
+	int dpr = self->delayReadPosition_, dpw = self->delayWritePosition_;
 
 	for (int sample = 0; sample < num_samples; ++sample) {
+
 		const float in = self->in[sample];
 		float out = 0.0f;
 
-		float rptr = fmodf((float)local_wptr - delay_time + (float)self->delaybuffer.samples,
-				  self->delaybuffer.samples);
-		int local_rptr = floorf(rptr);
+		out = (mix_dry * in + mix_wet * delay_data[dpr]);
 
-		if (local_rptr != local_wptr) {
-			float fraction = rptr - (float)local_rptr;
-			float delayed1 = delay_data[(local_rptr)];
-			float delayed2 = delay_data[(local_rptr) + 1];
-			out = delayed1 + fraction * (delayed2 - delayed1);
+		delay_data[dpw] = in + (delay_data[dpr] * feedback);
 
-			output_data[sample] = (mix_dry * in) + (mix_wet * (out - in));
-			delay_data[local_wptr] = in + (out * feedback);
-		}
+		if (++dpr >= delaybuffer_length) dpr = 0;
+		if (++dpw >= delaybuffer_length) dpw = 0;
 
-		if (++local_wptr >= self->delaybuffer.samples)
-			local_wptr -= self->delaybuffer.samples;
+		self->out[sample] = out;
+
 	}
 
-	self->delaybuffer.wptr = local_wptr;
-
-	memset(self->in, 0, num_samples);
+	self->delayReadPosition_  = dpr;
+	self->delayWritePosition_ = dpw;
 }
 
 static void
@@ -167,7 +163,7 @@ extension_data (const char *uri) {
 
 static const
 LV2_Descriptor descriptor = {
-	DELAY_URI,
+	URI,
 	instantiate,
 	connect_port,
 	activate,
